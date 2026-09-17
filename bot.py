@@ -1,735 +1,574 @@
-import asyncio
-import logging
 import os
 import sqlite3
-from datetime import datetime, timezone
+import logging
+from datetime import datetime
 
-from aiogram import Bot, Dispatcher, F
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery
-from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
-
-
-# =========================
-# تنظیمات
-# =========================
-TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-DB_PATH = os.getenv("DB_PATH", "utopia_ani.db")
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
 )
 
-dp = Dispatcher()
+# =========================
+# تنظیمات ربات
+# =========================
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "توکن_ربات_را_اینجا_بگذار")
+
+ADMIN_ID = 7748250995
+SUPPORT_ID = 7748250995
+
+DOLLAR_PRICE = 225000
+
+TRX_ADDRESS = "TUuNDqfEBSWUjZhwtEqi7NAzp4AuDTeGbj"
+
+DB_NAME = "utopia_ani.db"
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+
+logger = logging.getLogger(__name__)
 
 
 # =========================
-# ابزارهای عمومی
+# دیتابیس
 # =========================
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
 
 def db():
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    return con
+    return sqlite3.connect(DB_NAME)
 
 
 def init_db():
     con = db()
-    con.executescript(
-        """
+    cur = con.cursor()
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY,
+            user_id INTEGER PRIMARY KEY,
             username TEXT,
             first_name TEXT,
-            balance INTEGER DEFAULT 0,
-            created_at TEXT NOT NULL
-        );
+            referrer_id INTEGER,
+            referral_count INTEGER DEFAULT 0,
+            referral_reward INTEGER DEFAULT 0,
+            wallet_balance REAL DEFAULT 0,
+            created_at TEXT
+        )
+    """)
 
-        CREATE TABLE IF NOT EXISTS vouchers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            code TEXT UNIQUE NOT NULL,
-            amount INTEGER NOT NULL,
-            price INTEGER NOT NULL,
-            status TEXT DEFAULT 'available',
-            seller_id INTEGER,
-            created_at TEXT NOT NULL
-        );
-
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            voucher_id INTEGER NOT NULL,
-            amount INTEGER NOT NULL,
-            price INTEGER NOT NULL,
-            status TEXT DEFAULT 'pending_payment',
-            receipt_file_id TEXT,
-            created_at TEXT NOT NULL
-        );
+            user_id INTEGER,
+            order_type TEXT,
+            amount REAL,
+            amount_toman INTEGER,
+            status TEXT,
+            payment_info TEXT,
+            created_at TEXT
+        )
+    """)
 
-        CREATE TABLE IF NOT EXISTS sell_requests (
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            code TEXT NOT NULL,
-            amount INTEGER NOT NULL,
-            status TEXT DEFAULT 'pending',
-            created_at TEXT NOT NULL
-        );
+            user_id INTEGER,
+            message TEXT,
+            created_at TEXT
+        )
+    """)
 
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
-        """
-    )
-
-    con.execute(
-        """
-        INSERT OR IGNORE INTO settings(key, value)
-        VALUES('payment_text', ?)
-        """,
-        ("پرداخت را طبق دستور ادمین انجام دهید و رسید را ارسال کنید.",),
-    )
     con.commit()
     con.close()
 
 
-def upsert_user(user):
+def add_user(user, referrer_id=None):
     con = db()
-    con.execute(
-        """
-        INSERT INTO users(id, username, first_name, created_at)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-            username=excluded.username,
-            first_name=excluded.first_name
-        """,
-        (user.id, user.username, user.first_name, now_iso()),
+    cur = con.cursor()
+
+    cur.execute(
+        "SELECT user_id FROM users WHERE user_id = ?",
+        (user.id,),
     )
+
+    exists = cur.fetchone()
+
+    if not exists:
+        cur.execute("""
+            INSERT INTO users (
+                user_id,
+                username,
+                first_name,
+                referrer_id,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+        """, (
+            user.id,
+            user.username or "",
+            user.first_name or "",
+            referrer_id,
+            datetime.now().isoformat(),
+        ))
+
+        if referrer_id and referrer_id != user.id:
+            cur.execute("""
+                UPDATE users
+                SET referral_count = referral_count + 1
+                WHERE user_id = ?
+            """, (referrer_id,))
+
+            cur.execute("""
+                SELECT referral_count, referral_reward
+                FROM users
+                WHERE user_id = ?
+            """, (referrer_id,))
+
+            result = cur.fetchone()
+
+            if result:
+                referral_count, referral_reward = result
+
+                # هر ۱۰ دعوت موفق، یک دلار
+                possible_reward = referral_count // 10
+
+                if possible_reward > referral_reward:
+                    new_reward = possible_reward - referral_reward
+
+                    cur.execute("""
+                        UPDATE users
+                        SET referral_reward = ?,
+                            wallet_balance = wallet_balance + ?
+                        WHERE user_id = ?
+                    """, (
+                        possible_reward,
+                        new_reward,
+                        referrer_id,
+                    ))
+
     con.commit()
     con.close()
 
 
-def payment_text() -> str:
+def get_user(user_id):
     con = db()
-    row = con.execute(
-        "SELECT value FROM settings WHERE key='payment_text'"
-    ).fetchone()
-    con.close()
-    return row["value"] if row else "پرداخت را طبق دستور ادمین انجام دهید."
+    cur = con.cursor()
 
-
-def is_admin(message: Message) -> bool:
-    return bool(ADMIN_ID and message.from_user and message.from_user.id == ADMIN_ID)
-
-
-def parse_number(value: str) -> int:
-    value = (
-        value.replace(",", "")
-        .replace("٬", "")
-        .replace(" ", "")
-        .strip()
+    cur.execute(
+        "SELECT * FROM users WHERE user_id = ?",
+        (user_id,),
     )
-    if not value.isdigit():
-        raise ValueError
-    number = int(value)
-    if number <= 0:
-        raise ValueError
-    return number
 
-
-# =========================
-# کیبوردها
-# =========================
-def menu():
-    kb = ReplyKeyboardBuilder()
-    kb.button(text="🛒 خرید ووچر یوتوپیا")
-    kb.button(text="💰 فروش ووچر یوتوپیا")
-    kb.button(text="👤 حساب من")
-    kb.button(text="📞 پشتیبانی")
-    kb.button(text="❌ لغو عملیات")
-    kb.adjust(1, 1, 2, 1)
-    return kb.as_markup(resize_keyboard=True)
-
-
-def amounts_keyboard():
-    con = db()
-    rows = con.execute(
-        """
-        SELECT amount, MIN(price) AS price
-        FROM vouchers
-        WHERE status='available'
-        GROUP BY amount
-        ORDER BY amount
-        """
-    ).fetchall()
+    result = cur.fetchone()
     con.close()
 
-    kb = InlineKeyboardBuilder()
-    for row in rows:
-        kb.button(
-            text=f"ووچر {row['amount']:,} — {row['price']:,}",
-            callback_data=f"buy_amount:{row['amount']}",
-        )
-    kb.adjust(1)
-    return kb.as_markup()
+    return result
 
 
-# =========================
-# حالت‌ها
-# =========================
-class SellStates(StatesGroup):
-    amount = State()
-    code = State()
-
-
-class BuyStates(StatesGroup):
-    waiting_receipt = State()
-
-
-# =========================
-# شروع و لغو
-# =========================
-@dp.message(CommandStart())
-async def start(message: Message, state: FSMContext):
-    await state.clear()
-    upsert_user(message.from_user)
-    await message.answer(
-        "✨ <b>یوتوپیا آنی</b>\n\n"
-        "خرید و فروش <b>ووچر یوتوپیا</b> با تحویل سریع.\n"
-        "از منوی زیر انتخاب کنید:",
-        reply_markup=menu(),
-    )
-
-
-@dp.message(F.text == "❌ لغو عملیات")
-@dp.message(Command("cancel"))
-async def cancel(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer("✅ عملیات لغو شد.", reply_markup=menu())
-
-
-# =========================
-# خرید
-# =========================
-@dp.message(F.text == "🛒 خرید ووچر یوتوپیا")
-async def buy(message: Message, state: FSMContext):
-    await state.clear()
-    upsert_user(message.from_user)
-
-    keyboard = amounts_keyboard()
-    if not keyboard.inline_keyboard:
-        await message.answer("❌ فعلاً ووچری برای فروش موجود نیست.", reply_markup=menu())
-        return
-
-    await message.answer(
-        "مبلغ ووچر را انتخاب کنید:",
-        reply_markup=keyboard,
-    )
-
-
-@dp.callback_query(F.data.startswith("buy_amount:"))
-async def choose_buy(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-
-    try:
-        amount = int(callback.data.split(":", 1)[1])
-    except (ValueError, IndexError):
-        await callback.answer("مبلغ نامعتبر است.", show_alert=True)
-        return
-
+def create_order(
+    user_id,
+    order_type,
+    amount,
+    amount_toman,
+    payment_info="",
+):
     con = db()
-    row = con.execute(
-        """
-        SELECT *
-        FROM vouchers
-        WHERE amount=? AND status='available'
-        ORDER BY price ASC, id ASC
-        LIMIT 1
-        """,
-        (amount,),
-    ).fetchone()
+    cur = con.cursor()
 
-    if not row:
-        con.close()
-        await callback.answer("این مبلغ فعلاً موجود نیست.", show_alert=True)
-        return
-
-    cur = con.execute(
-        """
-        INSERT INTO orders(
-            user_id, voucher_id, amount, price, status, created_at
+    cur.execute("""
+        INSERT INTO orders (
+            user_id,
+            order_type,
+            amount,
+            amount_toman,
+            status,
+            payment_info,
+            created_at
         )
-        VALUES (?, ?, ?, ?, 'pending_payment', ?)
-        """,
-        (
-            callback.from_user.id,
-            row["id"],
-            row["amount"],
-            row["price"],
-            now_iso(),
-        ),
-    )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (
+        user_id,
+        order_type,
+        amount,
+        amount_toman,
+        "pending",
+        payment_info,
+        datetime.now().isoformat(),
+    ))
+
     order_id = cur.lastrowid
+
     con.commit()
     con.close()
 
-    await state.update_data(order_id=order_id)
-    await state.set_state(BuyStates.waiting_receipt)
+    return order_id
 
-    await callback.message.answer(
-        f"🧾 سفارش <b>#{order_id}</b>\n"
-        f"مبلغ ووچر: <b>{row['amount']:,}</b>\n"
-        f"قیمت: <b>{row['price']:,}</b>\n\n"
-        "پرداخت را طبق دستور زیر انجام دهید و سپس رسید را همینجا بفرستید:\n\n"
-        f"{payment_text()}\n\n"
-        "برای لغو، روی «❌ لغو عملیات» بزنید.",
-        reply_markup=menu(),
+
+# =========================
+# ابزارها
+# =========================
+
+async def notify_admin(context, text):
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=text,
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        logger.error("Admin notification error: %s", e)
+
+
+def main_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🛒 خرید ووچر",
+                callback_data="buy",
+            ),
+            InlineKeyboardButton(
+                "💸 فروش ووچر",
+                callback_data="sell",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "👥 دعوت دوستان",
+                callback_data="referral",
+            ),
+            InlineKeyboardButton(
+                "💰 کیف پول",
+                callback_data="wallet",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "📦 سفارش‌های من",
+                callback_data="my_orders",
+            ),
+            InlineKeyboardButton(
+                "🆘 پشتیبانی",
+                callback_data="support",
+            ),
+        ],
+    ])
+
+
+# =========================
+# شروع
+# =========================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+
+    referrer_id = None
+
+    if context.args:
+        try:
+            referrer_id = int(context.args[0])
+        except ValueError:
+            referrer_id = None
+
+    add_user(user, referrer_id)
+
+    text = (
+        "🌐 <b>به Utopia Ani خوش آمدید</b>\n\n"
+        "خرید و فروش ووچر یوتوپیا با پشتیبانی دستی.\n\n"
+        f"💵 قیمت هر دلار: <b>{DOLLAR_PRICE:,} تومان</b>\n"
+        "🔒 پرداخت‌ها پس از بررسی ادمین تأیید می‌شوند."
     )
-    await callback.answer()
 
-
-@dp.message(BuyStates.waiting_receipt)
-async def receipt(message: Message, state: FSMContext):
-    data = await state.get_data()
-    order_id = data.get("order_id")
-
-    if not order_id:
-        await state.clear()
-        await message.answer("سفارش پیدا نشد. دوباره از منو شروع کنید.", reply_markup=menu())
-        return
-
-    file_id = None
-    if message.photo:
-        file_id = message.photo[-1].file_id
-    elif message.document:
-        file_id = message.document.file_id
-    elif message.text:
-        file_id = message.text[:1000]
-
-    if not file_id:
-        await message.answer("لطفاً عکس رسید، فایل رسید یا متن رسید را ارسال کنید.")
-        return
-
-    con = db()
-    con.execute(
-        """
-        UPDATE orders
-        SET status='receipt_sent', receipt_file_id=?
-        WHERE id=? AND user_id=?
-        """,
-        (file_id, order_id, message.from_user.id),
-    )
-    con.commit()
-    con.close()
-
-    await state.clear()
-    await message.answer(
-        "✅ رسید دریافت شد. پس از تأیید ادمین، ووچر برای شما ارسال می‌شود.",
-        reply_markup=menu(),
+    await update.message.reply_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_keyboard(),
     )
 
-    if ADMIN_ID:
-        await message.bot.send_message(
-            ADMIN_ID,
-            f"🔔 رسید سفارش #{order_id}\n"
-            f"کاربر: {message.from_user.id} "
-            f"(@{message.from_user.username or '-'})\n"
-            "برای بررسی: /orders",
+
+# =========================
+# منوی اصلی
+# =========================
+
+async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    data = query.data
+
+    if data == "buy":
+        context.user_data["state"] = "buy_amount"
+
+        await query.edit_message_text(
+            "🛒 <b>خرید ووچر</b>\n\n"
+            "مقدار دلار موردنظر را به عدد وارد کن.\n"
+            "مثال: <code>5</code>",
+            parse_mode=ParseMode.HTML,
+        )
+
+    elif data == "sell":
+        context.user_data["state"] = "sell_code"
+
+        await query.edit_message_text(
+            "💸 <b>فروش ووچر</b>\n\n"
+            "کد ووچر خود را ارسال کن.",
+            parse_mode=ParseMode.HTML,
+        )
+
+    elif data == "referral":
+        bot_username = (await context.bot.get_me()).username
+
+        referral_link = (
+            f"https://t.me/{bot_username}?start={user_id}"
+        )
+
+        user = get_user(user_id)
+
+        referral_count = user[4] if user else 0
+        balance = user[6] if user else 0
+
+        await query.edit_message_text(
+            "👥 <b>سیستم دعوت دوستان</b>\n\n"
+            "به ازای هر ۱۰ عضو واجد شرایط، ۱ دلار پاداش می‌گیری.\n\n"
+            f"👤 تعداد دعوت‌ها: <b>{referral_count}</b>\n"
+            f"💰 موجودی پاداش: <b>{balance}</b> دلار\n\n"
+            "🔗 لینک دعوت شما:\n"
+            f"<code>{referral_link}</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "🔙 بازگشت",
+                        callback_data="back",
+                    )
+                ]
+            ]),
+        )
+
+    elif data == "wallet":
+        user = get_user(user_id)
+
+        balance = user[6] if user else 0
+
+        await query.edit_message_text(
+            "💰 <b>کیف پول</b>\n\n"
+            f"موجودی شما: <b>{balance}</b> دلار\n\n"
+            "این کیف پول فقط برای پاداش دعوت استفاده می‌شود.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "🔙 بازگشت",
+                        callback_data="back",
+                    )
+                ]
+            ]),
+        )
+
+    elif data == "support":
+        context.user_data["state"] = "support"
+
+        await query.edit_message_text(
+            "🆘 پیام خود را برای پشتیبانی ارسال کن.",
+            parse_mode=ParseMode.HTML,
+        )
+
+    elif data == "my_orders":
+        con = db()
+        cur = con.cursor()
+
+        cur.execute("""
+            SELECT id, order_type, amount, status, created_at
+            FROM orders
+            WHERE user_id = ?
+            ORDER BY id DESC
+            LIMIT 10
+        """, (user_id,))
+
+        orders = cur.fetchall()
+        con.close()
+
+        if not orders:
+            text = "📦 هنوز سفارشی ثبت نکرده‌ای."
+        else:
+            text = "📦 <b>سفارش‌های اخیر شما</b>\n\n"
+
+            for order in orders:
+                oid, otype, amount, status, created_at = order
+
+                text += (
+                    f"#{oid} | {otype} | {amount}\n"
+                    f"وضعیت: {status}\n\n"
+                )
+
+        await query.edit_message_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "🔙 بازگشت",
+                        callback_data="back",
+                    )
+                ]
+            ]),
+        )
+
+    elif data == "back":
+        await query.edit_message_text(
+            "🌐 <b>منوی اصلی Utopia Ani</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_keyboard(),
         )
 
 
 # =========================
-# فروش
+# دریافت پیام‌های متنی
 # =========================
-@dp.message(F.text == "💰 فروش ووچر یوتوپیا")
-async def sell_start(message: Message, state: FSMContext):
-    await state.clear()
-    await state.set_state(SellStates.amount)
-    await message.answer("مبلغ ووچر را به عدد وارد کنید (مثلاً 100000):")
 
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    text = update.message.text.strip()
 
-@dp.message(SellStates.amount)
-async def sell_amount(message: Message, state: FSMContext):
-    try:
-        amount = parse_number(message.text or "")
-    except ValueError:
-        await message.answer("لطفاً مبلغ را فقط به صورت عددی وارد کنید.")
-        return
+    add_user(user)
 
-    await state.update_data(amount=amount)
-    await state.set_state(SellStates.code)
-    await message.answer("حالا کد ووچر را ارسال کنید:")
+    state = context.user_data.get("state")
 
+    if state == "buy_amount":
+        try:
+            amount = float(text)
 
-@dp.message(SellStates.code)
-async def sell_code(message: Message, state: FSMContext):
-    data = await state.get_data()
-    code = (message.text or "").strip()
+            if amount <= 0:
+                raise ValueError
 
-    if not code:
-        await message.answer("کد ووچر نمی‌تواند خالی باشد.")
-        return
-
-    con = db()
-    try:
-        cur = con.execute(
-            """
-            INSERT INTO sell_requests(
-                user_id, code, amount, status, created_at
+        except ValueError:
+            await update.message.reply_text(
+                "❌ مقدار واردشده صحیح نیست. مثال: 5"
             )
-            VALUES (?, ?, ?, 'pending', ?)
-            """,
-            (message.from_user.id, code, data["amount"], now_iso()),
+            return
+
+        toman = int(amount * DOLLAR_PRICE)
+
+        order_id = create_order(
+            user_id=user.id,
+            order_type="buy",
+            amount=amount,
+            amount_toman=toman,
         )
-        request_id = cur.lastrowid
+
+        context.user_data["state"] = f"buy_payment_{order_id}"
+
+        await update.message.reply_text(
+            "🛒 <b>جزئیات خرید</b>\n\n"
+            f"💵 مقدار: <b>{amount} دلار</b>\n"
+            f"💰 مبلغ: <b>{toman:,} تومان</b>\n\n"
+            "برای پرداخت TRX روی شبکه TRC20، مبلغ معادل را به آدرس زیر ارسال کن:\n\n"
+            f"<code>{TRX_ADDRESS}</code>\n\n"
+            "بعد از پرداخت، هش تراکنش یا تصویر رسید را ارسال کن.",
+            parse_mode=ParseMode.HTML,
+        )
+
+        await notify_admin(
+            context,
+            "🛒 <b>سفارش خرید جدید</b>\n\n"
+            f"Order ID: {order_id}\n"
+            f"User ID: {user.id}\n"
+            f"Username: @{user.username or 'ندارد'}\n"
+            f"Amount: {amount} USD\n"
+            f"Price: {toman:,} تومان",
+        )
+
+    elif state and state.startswith("buy_payment_"):
+        order_id = state.split("_")[-1]
+
+        con = db()
+        cur = con.cursor()
+
+        cur.execute("""
+            UPDATE orders
+            SET payment_info = ?
+            WHERE id = ?
+        """, (text, order_id))
+
         con.commit()
-    except sqlite3.IntegrityError:
         con.close()
-        await message.answer("این کد قبلاً ثبت شده است.")
-        return
 
-    con.close()
-    await state.clear()
+        context.user_data["state"] = None
 
-    await message.answer(
-        f"✅ درخواست فروش #{request_id} ثبت شد.\n"
-        "پس از بررسی ووچر، نتیجه و مبلغ تسویه اعلام می‌شود.",
-        reply_markup=menu(),
-    )
-
-    if ADMIN_ID:
-        await message.bot.send_message(
-            ADMIN_ID,
-            f"🔔 درخواست فروش #{request_id}\n"
-            f"کاربر: {message.from_user.id}\n"
-            f"مبلغ: {data['amount']:,}\n"
-            f"کد: <code>{code}</code>\n"
-            "برای بررسی از /sell_requests استفاده کنید.",
+        await update.message.reply_text(
+            "✅ اطلاعات پرداخت ثبت شد.\n"
+            "پس از بررسی ادمین، ووچر برای شما ارسال می‌شود."
         )
 
-
-# =========================
-# حساب و پشتیبانی
-# =========================
-@dp.message(F.text == "👤 حساب من")
-async def account(message: Message, state: FSMContext):
-    await state.clear()
-    upsert_user(message.from_user)
-
-    con = db()
-    user = con.execute(
-        "SELECT * FROM users WHERE id=?",
-        (message.from_user.id,),
-    ).fetchone()
-    buys = con.execute(
-        """
-        SELECT COUNT(*) AS n
-        FROM orders
-        WHERE user_id=? AND status='completed'
-        """,
-        (message.from_user.id,),
-    ).fetchone()["n"]
-    sells = con.execute(
-        """
-        SELECT COUNT(*) AS n
-        FROM sell_requests
-        WHERE user_id=? AND status='approved'
-        """,
-        (message.from_user.id,),
-    ).fetchone()["n"]
-    con.close()
-
-    await message.answer(
-        f"👤 <b>حساب شما</b>\n\n"
-        f"آیدی: <code>{message.from_user.id}</code>\n"
-        f"موجودی: {user['balance']:,}\n"
-        f"خریدهای تکمیل‌شده: {buys}\n"
-        f"فروش‌های تأییدشده: {sells}",
-        reply_markup=menu(),
-    )
-
-
-@dp.message(F.text == "📞 پشتیبانی")
-async def support(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer(
-        "📞 پیام خود را همینجا ارسال کنید.\n"
-        "در صورت آنلاین بودن ادمین، پاسخ داده می‌شود.",
-        reply_markup=menu(),
-    )
-
-
-# =========================
-# دستورات ادمین
-# =========================
-@dp.message(Command("orders"))
-async def orders(message: Message):
-    if not is_admin(message):
-        return
-
-    con = db()
-    rows = con.execute(
-        """
-        SELECT o.id, o.user_id, o.amount, o.price, o.status, v.code
-        FROM orders o
-        JOIN vouchers v ON v.id=o.voucher_id
-        WHERE o.status!='completed'
-        ORDER BY o.id DESC
-        LIMIT 30
-        """
-    ).fetchall()
-    con.close()
-
-    if not rows:
-        await message.answer("سفارشی برای بررسی نیست.")
-        return
-
-    text = "📋 <b>سفارش‌های در انتظار</b>\n\n"
-    for row in rows:
-        text += (
-            f"#{row['id']} | user {row['user_id']} | "
-            f"{row['amount']:,} | {row['price']:,} | {row['status']}\n"
+        await notify_admin(
+            context,
+            "💳 <b>اطلاعات پرداخت خرید</b>\n\n"
+            f"Order ID: {order_id}\n"
+            f"User ID: {user.id}\n"
+            f"Payment info:\n{text}",
         )
 
-    await message.answer(
-        text
-        + "\nبرای تأیید: /approve_order ID"
-        + "\nبرای رد: /reject_order ID"
-    )
+    elif state == "sell_code":
+        context.user_data["voucher_code"] = text
+        context.user_data["state"] = "sell_iban"
 
-
-@dp.message(Command("approve_order"))
-async def approve_order(message: Message):
-    if not is_admin(message):
-        return
-
-    parts = message.text.split()
-    if len(parts) != 2 or not parts[1].isdigit():
-        await message.answer("مثال: /approve_order 12")
-        return
-
-    order_id = int(parts[1])
-    con = db()
-    row = con.execute(
-        """
-        SELECT o.*, v.code, v.id AS voucher_id
-        FROM orders o
-        JOIN vouchers v ON v.id=o.voucher_id
-        WHERE o.id=?
-        """,
-        (order_id,),
-    ).fetchone()
-
-    if not row:
-        con.close()
-        await message.answer("سفارش پیدا نشد.")
-        return
-
-    if row["status"] == "completed":
-        con.close()
-        await message.answer("این سفارش قبلاً تأیید شده است.")
-        return
-
-    con.execute(
-        "UPDATE orders SET status='completed' WHERE id=?",
-        (order_id,),
-    )
-    con.execute(
-        "UPDATE vouchers SET status='sold' WHERE id=?",
-        (row["voucher_id"],),
-    )
-    con.commit()
-    con.close()
-
-    await message.bot.send_message(
-        row["user_id"],
-        f"🎉 پرداخت تأیید شد!\n\n"
-        f"ووچر یوتوپیا شما:\n<code>{row['code']}</code>\n\n"
-        f"مبلغ: {row['amount']:,}",
-    )
-    await message.answer("✅ سفارش تأیید و ووچر ارسال شد.")
-
-
-@dp.message(Command("reject_order"))
-async def reject_order(message: Message):
-    if not is_admin(message):
-        return
-
-    parts = message.text.split()
-    if len(parts) != 2 or not parts[1].isdigit():
-        await message.answer("مثال: /reject_order 12")
-        return
-
-    order_id = int(parts[1])
-    con = db()
-    row = con.execute(
-        "SELECT user_id, status FROM orders WHERE id=?",
-        (order_id,),
-    ).fetchone()
-
-    if not row:
-        con.close()
-        await message.answer("سفارش پیدا نشد.")
-        return
-
-    con.execute(
-        "UPDATE orders SET status='rejected' WHERE id=?",
-        (order_id,),
-    )
-    con.commit()
-    con.close()
-
-    await message.bot.send_message(
-        row["user_id"],
-        "❌ پرداخت سفارش شما تأیید نشد. برای پیگیری با پشتیبانی تماس بگیرید.",
-    )
-    await message.answer("سفارش رد شد.")
-
-
-@dp.message(Command("addvoucher"))
-async def addvoucher(message: Message):
-    if not is_admin(message):
-        return
-
-    parts = message.text.split(maxsplit=3)
-    if len(parts) != 4:
-        await message.answer(
-            "فرمت:\n"
-            "/addvoucher مبلغ قیمت کد\n\n"
-            "مثال:\n"
-            "/addvoucher 100000 95000 ABC123"
+        await update.message.reply_text(
+            "✅ کد ووچر دریافت شد.\n\n"
+            "لطفاً شماره شبا خود را بدون فاصله ارسال کن."
         )
-        return
 
-    try:
-        amount = parse_number(parts[1])
-        price = parse_number(parts[2])
-    except ValueError:
-        await message.answer("مبلغ و قیمت باید عددی باشند.")
-        return
+    elif state == "sell_iban":
+        voucher_code = context.user_data.get("voucher_code", "")
+        iban = text
 
-    code = parts[3].strip()
-    if not code:
-        await message.answer("کد ووچر خالی است.")
-        return
+        order_id = create_order(
+            user_id=user.id,
+            order_type="sell",
+            amount=0,
+            amount_toman=0,
+            payment_info=(
+                f"Voucher: {voucher_code}\n"
+                f"IBAN: {iban}"
+            ),
+        )
 
-    con = db()
-    try:
-        con.execute(
-            """
-            INSERT INTO vouchers(
-                code, amount, price, status, created_at
+        context.user_data["state"] = None
+        context.user_data["voucher_code"] = None
+
+        await update.message.reply_text(
+            "✅ درخواست فروش شما ثبت شد.\n"
+            "پس از بررسی ووچر، مبلغ به شماره شبای شما واریز می‌شود."
+        )
+
+        await notify_admin(
+            context,
+            "💸 <b>درخواست فروش ووچر</b>\n\n"
+            f"Order ID: {order_id}\n"
+            f"User ID: {user.id}\n"
+            f"Username: @{user.username or 'ندارد'}\n\n"
+            f"Voucher:\n{voucher_code}\n\n"
+            f"IBAN:\n{iban}",
+        )
+
+    elif state == "support":
+        context.user_data["state"] = None
+
+        con = db()
+        cur = con.cursor()
+
+        cur.execute("""
+            INSERT INTO messages (
+                user_id,
+                message,
+                created_at
             )
-            VALUES (?, ?, ?, 'available', ?)
-            """,
-            (code, amount, price, now_iso()),
-        )
-        con.commit()
-    except sqlite3.IntegrityError:
-        con.close()
-        await message.answer("این کد قبلاً ثبت شده است.")
-        return
-
-    con.close()
-    await message.answer("✅ ووچر به موجودی اضافه شد.")
-
-
-@dp.message(Command("inventory"))
-async def inventory(message: Message):
-    if not is_admin(message):
-        return
-
-    con = db()
-    rows = con.execute(
-        """
-        SELECT amount, COUNT(*) AS n, MIN(price) AS p
-        FROM vouchers
-        WHERE status='available'
-        GROUP BY amount
-        ORDER BY amount
-        """
-    ).fetchall()
-    con.close()
-
-    if not rows:
-        await message.answer("موجودی خالی است.")
-        return
-
-    await message.answer(
-        "\n".join(
-            f"{row['amount']:,}: {row['n']} عدد | از {row['p']:,}"
-            for row in rows
-        )
-    )
-
-
-@dp.message(Command("sell_requests"))
-async def sell_requests(message: Message):
-    if not is_admin(message):
-        return
-
-    con = db()
-    rows = con.execute(
-        """
-        SELECT id, user_id, amount, code, status
-        FROM sell_requests
-        WHERE status='pending'
-        ORDER BY id DESC
-        LIMIT 30
-        """
-    ).fetchall()
-    con.close()
-
-    if not rows:
-        await message.answer("درخواست فروش در انتظار نیست.")
-        return
-
-    text = "📋 <b>درخواست‌های فروش</b>\n\n"
-    for row in rows:
-        text += (
-            f"#{row['id']} | user {row['user_id']} | "
-            f"{row['amount']:,} | {row['status']}\n"
-            f"کد: <code>{row['code']}</code>\n\n"
-        )
-
-    await message.answer(text)
-
-
-# =========================
-# اجرای ربات
-# =========================
-async def main():
-    if not TOKEN:
-        raise RuntimeError(
-            "متغیر BOT_TOKEN در Railway تنظیم نشده است."
-        )
-
-    if not ADMIN_ID:
-        logging.warning(
-            "ADMIN_ID تنظیم نشده؛ دستورات ادمین کار نمی‌کنند."
-        )
-
-    init_db()
-
-    bot = Bot(
-        TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
-
-    try:
-        await dp.start_polling(bot)
-    finally:
-        await bot.session.close()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
